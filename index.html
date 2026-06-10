@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#5cb85c">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="漫画me">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/icon.svg">
+    <title>RetrieverX</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+</head>
+<body>
+<div id="app" class="app">
+    <main id="screen"></main>
+    <nav class="tabbar" id="tabbar">
+        <button class="tab" data-tab="settings"><i class="fa-solid fa-gear"></i><span>Settings</span></button>
+        <button class="tab active" data-tab="projects"><i class="fa-solid fa-folder"></i><span>Projects</span></button>
+        <button class="tab" data-tab="browser"><i class="fa-solid fa-play"></i><span>Browser</span></button>
+        <button class="tab" data-tab="favorites"><i class="fa-regular fa-heart"></i><span>Favorites</span></button>
+        <button class="tab" data-tab="history"><i class="fa-solid fa-clock-rotate-left"></i><span>History</span></button>
+    </nav>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<div id="modal" class="overlay hidden">
+    <div class="overlay-bg" data-close></div>
+    <div class="sheet">
+        <header class="sheet-h"><h2 id="modal-title">新規プロジェクト</h2><button data-close class="x"><i class="fa-solid fa-xmark"></i></button></header>
+        <div class="sheet-b">
+            <label class="fld"><span>名前</span><input id="f-name"></label>
+            <label class="fld"><span>URLパターン</span><input id="f-pattern" placeholder="mangaraw.best"></label>
+            <label class="fld"><span>一覧ページURL</span><input id="f-list" placeholder="https://mangaraw.best/manga-list"></label>
+            <p class="grp">作品一覧</p>
+            <label class="fld"><span>カード</span><input id="f-card" placeholder=".manga-vertical"></label>
+            <label class="fld"><span>画像</span><input id="f-img" placeholder="img.cover"></label>
+            <label class="fld"><span>リンク</span><input id="f-link" placeholder='a[href^="/raw/"]'></label>
+            <p class="grp">話数一覧</p>
+            <label class="fld"><span>話リンク</span><input id="f-ch" placeholder='main a[href*="di-"]'></label>
+            <p class="grp">本編</p>
+            <label class="fld"><span>ページ画像</span><input id="f-media" placeholder='main img[src*="mgcdn"]'></label>
+        </div>
+        <footer class="sheet-f"><button id="f-save" class="btn">保存</button></footer>
+    </div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

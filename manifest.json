@@ -1,0 +1,19 @@
+{
+  "name": "RetrieverX",
+  "short_name": "漫画me",
+  "description": "漫画ビューア",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#5cb85c",
+  "theme_color": "#5cb85c",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
