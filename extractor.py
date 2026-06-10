@@ -139,15 +139,44 @@ def _fetch_cloudscraper(url):
     raise last_err
 
 
+def _is_render_host():
+    return bool(os.environ.get('RENDER') or os.environ.get('RENDER_SERVICE_ID'))
+
+
+def _cf_fetch_base():
+    return os.environ.get('CF_FETCH_URL', '').strip().rstrip('/')
+
+
+def _fetch_cf_worker(url):
+    base = _cf_fetch_base()
+    if not base:
+        raise RuntimeError('CF_FETCH_URL が未設定です')
+    proxy_url = f'{base}?url={quote(url, safe="")}'
+    headers = {'User-Agent': UA, 'Accept': 'text/html', 'Accept-Language': 'ja,en;q=0.9'}
+    r = requests.get(proxy_url, headers=headers, timeout=FETCH_TIMEOUT + 30)
+    html = _decode_response(r)
+    if _looks_blocked(r.status_code, html):
+        raise requests.HTTPError(f'cf-worker blocked ({r.status_code})', response=r)
+    r.raise_for_status()
+    return html
+
+
 def _proxy_routes(target_url):
     encoded = quote(target_url, safe='')
-    routes = [('allorigins', f'https://api.allorigins.win/raw?url={encoded}')]
+    routes = [
+        ('allorigins-raw', f'https://api.allorigins.win/raw?url={encoded}', 'raw'),
+        ('allorigins-get', f'https://api.allorigins.win/get?url={encoded}', 'json'),
+        ('corsproxy', f'https://corsproxy.io/?{encoded}', 'raw'),
+        ('codetabs', f'https://api.codetabs.com/v1/proxy?quest={encoded}', 'raw'),
+        ('corslol', f'https://api.cors.lol/?url={encoded}', 'raw'),
+    ]
 
     scraper_key = os.environ.get('SCRAPER_API_KEY', '').strip()
     if scraper_key:
         routes.append((
             'scraperapi',
             f'http://api.scraperapi.com?api_key={scraper_key}&url={encoded}',
+            'raw',
         ))
 
     crawlbase_token = os.environ.get('CRAWLBASE_TOKEN', '').strip()
@@ -155,18 +184,23 @@ def _proxy_routes(target_url):
         routes.append((
             'crawlbase',
             f'https://api.crawlbase.com/?token={crawlbase_token}&url={encoded}',
+            'raw',
         ))
 
     return routes
 
 
-def _fetch_via_proxy(proxy_name, proxy_url, target_url):
-    headers = {
-        'User-Agent': UA,
-        'Referer': _referer(target_url),
-        'Accept-Language': 'ja,en;q=0.9',
-    }
-    r = requests.get(proxy_url, headers=headers, timeout=FETCH_TIMEOUT + 15)
+def _parse_proxy_response(proxy_name, mode, r, target_url):
+    if mode == 'json':
+        data = r.json()
+        html = data.get('contents') or ''
+        status_code = (data.get('status') or {}).get('http_code') or r.status_code
+        if not html:
+            raise requests.HTTPError(f'empty proxy json via {proxy_name}', response=r)
+        if _looks_blocked(status_code, html):
+            raise requests.HTTPError(f'proxy blocked ({status_code}) via {proxy_name}', response=r)
+        return html
+
     html = _decode_response(r)
     if _looks_blocked(r.status_code, html):
         raise requests.HTTPError(f'proxy blocked ({r.status_code}) via {proxy_name}', response=r)
@@ -174,11 +208,41 @@ def _fetch_via_proxy(proxy_name, proxy_url, target_url):
     return html
 
 
+def _fetch_via_proxy(proxy_name, proxy_url, target_url, mode='raw'):
+    headers = {
+        'User-Agent': UA,
+        'Referer': _referer(target_url),
+        'Accept-Language': 'ja,en;q=0.9',
+    }
+    r = requests.get(proxy_url, headers=headers, timeout=FETCH_TIMEOUT + 30)
+    return _parse_proxy_response(proxy_name, mode, r, target_url)
+
+
 def _fetch_proxies(target_url):
+    routes = _proxy_routes(target_url)
+    if not routes:
+        raise RuntimeError('利用可能なプロキシがありません')
+
+    errors = []
+    if _is_render_host() and len(routes) > 1:
+        with ThreadPoolExecutor(max_workers=min(5, len(routes))) as pool:
+            futures = {
+                pool.submit(_fetch_via_proxy, name, proxy_url, target_url, mode): name
+                for name, proxy_url, mode in routes
+            }
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    return fut.result()
+                except Exception as e:
+                    errors.append(f'{name}: {e}')
+                    log.warning('proxy/%s failed for %s: %s', name, target_url, e)
+        raise RuntimeError(errors[-1] if errors else 'all proxies failed')
+
     last_err = None
-    for name, proxy_url in _proxy_routes(target_url):
+    for name, proxy_url, mode in routes:
         try:
-            return _fetch_via_proxy(name, proxy_url, target_url)
+            return _fetch_via_proxy(name, proxy_url, target_url, mode)
         except Exception as e:
             last_err = e
             log.warning('proxy/%s failed for %s: %s', name, target_url, e)
@@ -202,7 +266,13 @@ def _fetch_playwright(url):
             )
             page = context.new_page()
             page.goto(url, wait_until='domcontentloaded', timeout=BROWSER_TIMEOUT_MS)
-            page.wait_for_timeout(2500)
+            try:
+                page.wait_for_selector(
+                    '.manga-vertical, main img[src*="mgcdn"], a[href*="di-"][href*="hua"]',
+                    timeout=30000,
+                )
+            except Exception:
+                page.wait_for_timeout(4000)
             html = page.content()
             if _looks_blocked(200, html):
                 raise RuntimeError('playwright: challenge page detected')
@@ -240,13 +310,36 @@ def _fetch_browser(url):
         errors.append(f'playwright: {e}')
         log.warning('playwright failed for %s: %s', url, e)
 
-    try:
-        return _fetch_undetected_chrome(url)
-    except Exception as e:
-        errors.append(f'undetected-chromedriver: {e}')
-        log.warning('undetected-chromedriver failed for %s: %s', url, e)
+    if not _is_render_host():
+        try:
+            return _fetch_undetected_chrome(url)
+        except Exception as e:
+            errors.append(f'undetected-chromedriver: {e}')
+            log.warning('undetected-chromedriver failed for %s: %s', url, e)
 
     raise RuntimeError('; '.join(errors) or 'browser fallback unavailable')
+
+
+def _fetch_route_steps():
+    steps = [
+        ('requests', _fetch_requests),
+        ('cloudscraper', _fetch_cloudscraper),
+        ('proxy', _fetch_proxies),
+        ('browser', _fetch_browser),
+    ]
+    if _is_render_host():
+        # Render の DC IP は直接叩いてもほぼ弾かれる → 外部経由のみ
+        render_steps = []
+        if _cf_fetch_base():
+            render_steps.append(('cf-worker', _fetch_cf_worker))
+        render_steps.extend([steps[2], steps[3]])
+        return render_steps
+    if _cf_fetch_base():
+        return [
+            ('cf-worker', _fetch_cf_worker),
+            steps[0], steps[1], steps[2], steps[3],
+        ]
+    return steps
 
 
 def fetch_html(url):
@@ -255,54 +348,23 @@ def fetch_html(url):
       1. requests → 403等なら cloudscraper へ
       2. データセンターIPブロックなら CORS/スクレイピングAPI プロキシへ
       3. 最終手段: Playwright / undetected-chromedriver ヘッドレス
+    Render 上ではプロキシ経由を最優先する。
     """
     attempts = []
     status_hint = 403
 
-    # --- ケース1: 通常 requests → Bot検知(403)なら cloudscraper ---
-    try:
-        html = _fetch_requests(url)
-        attempts.append(_attempt_record('requests', True))
-        return html, 'requests'
-    except Exception as e:
-        detail = str(e)
-        attempts.append(_attempt_record('requests', False, detail))
-        resp = getattr(e, 'response', None)
-        if resp is not None:
-            status_hint = getattr(resp, 'status_code', status_hint)
-        log.info('requests blocked for %s → trying cloudscraper (%s)', url, detail)
-
-    try:
-        html = _fetch_cloudscraper(url)
-        attempts.append(_attempt_record('cloudscraper', True))
-        return html, 'cloudscraper'
-    except Exception as e:
-        detail = str(e)
-        attempts.append(_attempt_record('cloudscraper', False, detail))
-        resp = getattr(e, 'response', None)
-        if resp is not None:
-            status_hint = getattr(resp, 'status_code', status_hint)
-        log.info('cloudscraper blocked for %s → trying proxies (%s)', url, detail)
-
-    # --- ケース2: Render等 DC IP ブロック → 外部プロキシ経由 ---
-    try:
-        html = _fetch_proxies(url)
-        attempts.append(_attempt_record('proxy', True))
-        return html, 'proxy'
-    except Exception as e:
-        detail = str(e)
-        attempts.append(_attempt_record('proxy', False, detail))
-        log.info('proxies blocked for %s → trying browser (%s)', url, detail)
-
-    # --- ケース3: 最終手段 → ステルスヘッドレスブラウザ ---
-    try:
-        html = _fetch_browser(url)
-        attempts.append(_attempt_record('browser', True))
-        return html, 'browser'
-    except Exception as e:
-        detail = str(e)
-        attempts.append(_attempt_record('browser', False, detail))
-        log.error('all bypass routes failed for %s: %s', url, detail)
+    for route_name, fetcher in _fetch_route_steps():
+        try:
+            html = fetcher(url)
+            attempts.append(_attempt_record(route_name, True))
+            return html, route_name
+        except Exception as e:
+            detail = str(e)
+            attempts.append(_attempt_record(route_name, False, detail))
+            resp = getattr(e, 'response', None)
+            if resp is not None:
+                status_hint = getattr(resp, 'status_code', status_hint)
+            log.info('%s failed for %s: %s', route_name, url, detail)
 
     raise FetchBlockedError(status=status_hint, attempts=attempts)
 
@@ -661,11 +723,18 @@ def extract():
         print(f'OK [{mode}] {url} → {len(out.get("items") or out.get("images") or [])} items')
         return jsonify(out)
     except FetchBlockedError as e:
+        hint = (
+            '自宅PCで python extractor.py を起動し、'
+            'Settings → サーバーURL に http://192.168.x.x:5000 を設定すると安定します。'
+        )
+        if _is_render_host():
+            hint += ' Render無料枠では外部APIキー(SCRAPER_API_KEY)の設定も有効です。'
         return jsonify({
             'error': e.message,
             'status': e.status,
             'message': e.message,
             'attempts': e.attempts,
+            'hint': hint,
         }), e.status
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
@@ -712,7 +781,36 @@ def proxy_image():
 
 @app.route('/health')
 def health():
-    return jsonify({'ok': True})
+    return jsonify({
+        'ok': True,
+        'host': 'render' if _is_render_host() else 'local',
+        'cf_worker': bool(_cf_fetch_base()),
+        'scraper_api': bool(os.environ.get('SCRAPER_API_KEY', '').strip()),
+        'proxy_routes': [name for name, _, _ in _proxy_routes('https://example.com')],
+        'render_strategy': 'cf-worker→proxy(parallel)→browser' if _is_render_host() else 'direct-first',
+    })
+
+
+@app.route('/diagnose')
+def diagnose():
+    """どの突破ルートが通るか簡易診断（Render ログ確認用）。"""
+    target = (request.args.get('url') or 'https://mangaraw.best/manga-list').strip()
+    try:
+        html, route = fetch_html(target)
+        return jsonify({
+            'ok': True,
+            'route': route,
+            'length': len(html),
+            'host': 'render' if _is_render_host() else 'local',
+        })
+    except FetchBlockedError as e:
+        return jsonify({
+            'ok': False,
+            'status': e.status,
+            'message': e.message,
+            'attempts': e.attempts,
+            'host': 'render' if _is_render_host() else 'local',
+        }), e.status
 
 
 @app.route('/')

@@ -10,3 +10,9 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.7"
+      # 任意: Cloudflare Worker URL (cloudflare-worker.js をデプロイ後に設定)
+      # - key: CF_FETCH_URL
+      #   value: "https://your-worker.workers.dev"
+      # 任意: ScraperAPI 無料キー (月1000リクエスト)
+      # - key: SCRAPER_API_KEY
+      #   sync: false

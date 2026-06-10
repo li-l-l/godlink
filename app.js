@@ -212,7 +212,15 @@ async function call(body) {
         throw new Error('サーバーに接続できません。extractor.py を起動し、http://127.0.0.1:5000 を開いてください');
     }
     const d = await r.json();
-    if (!r.ok || d.error) throw new Error(d.error || '通信エラー');
+    if (!r.ok || d.error) {
+        let msg = d.message || d.error || '通信エラー';
+        if (d.attempts?.length) {
+            const failed = d.attempts.filter(a => !a.ok).map(a => a.route).join(' → ');
+            if (failed) msg += `\n\n試行: ${failed}`;
+        }
+        if (d.hint) msg += `\n\n${d.hint}`;
+        throw new Error(msg);
+    }
     return d;
 }
 
@@ -237,7 +245,7 @@ function err(msg) {
         </div>
         <div class="err-box">
             <i class="fa-solid fa-circle-exclamation"></i>
-            <p class="err">${esc(msg)}</p>
+            <p class="err" style="white-space:pre-wrap">${esc(msg)}</p>
             <button class="btn-sm" id="retry-btn">再試行</button>
         </div>`;
     $('#eb').onclick = popNav;
