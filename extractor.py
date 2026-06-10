@@ -26,15 +26,18 @@ UA_CHROME = (
 )
 UA = UA_SAFARI_IOS
 
+# CDN 由来の "cloudflare" / "challenge-platform" は正常ページにも出るため除外
 BLOCK_PATTERNS = (
-    'just a moment',
+    '<title>just a moment',
     'cf-browser-verification',
-    'challenge-platform',
+    'checking your browser before accessing',
     'checking your browser',
     'access denied',
-    'enable javascript and cookies',
-    'attention required',
-    'cloudflare',
+    'enable javascript and cookies to continue',
+    'attention required! | cloudflare',
+)
+VALID_PAGE_HINTS = (
+    'manga-vertical', 'manga-list', 'mgcdn', 'mangaraw', 'di-1hua',
 )
 # lazy-load 突破: プレースホルダ src より data-* を優先
 IMG_ATTRS = (
@@ -75,10 +78,12 @@ def _looks_blocked(status_code, html):
     if not html or len(html.strip()) < 300:
         return True
     lower = html.lower()
-    hits = sum(1 for p in BLOCK_PATTERNS if p in lower)
-    if hits >= 2:
+    if any(p in lower for p in BLOCK_PATTERNS):
         return True
-    if 'just a moment' in lower or 'cf-browser-verification' in lower:
+    # 200 かつ漫画サイトの実コンテンツがあれば CDN 文字列による誤検知を避ける
+    if status_code == 200 and any(h in lower for h in VALID_PAGE_HINTS):
+        return False
+    if 'just a moment' in lower and 'cloudflare' in lower:
         return True
     return False
 
