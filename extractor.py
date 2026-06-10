@@ -1,9 +1,10 @@
+import logging
 import os
 import re
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -13,10 +14,27 @@ from flask_cors import CORS
 app = Flask(__name__)
 CORS(app)
 ROOT = os.path.dirname(os.path.abspath(__file__))
+log = logging.getLogger(__name__)
 
-UA = (
+UA_SAFARI_IOS = (
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
     'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+)
+UA_CHROME = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+)
+UA = UA_SAFARI_IOS
+
+BLOCK_PATTERNS = (
+    'just a moment',
+    'cf-browser-verification',
+    'challenge-platform',
+    'checking your browser',
+    'access denied',
+    'enable javascript and cookies',
+    'attention required',
+    'cloudflare',
 )
 # lazy-load 突破: プレースホルダ src より data-* を優先
 IMG_ATTRS = (
@@ -32,20 +50,275 @@ YEAR_RE = re.compile(r'\b(19|20)\d{2}\b')
 CHAPTER_RE = re.compile(r'第?\s*(\d+)\s*話|di-(\d+)hua', re.I)
 PAGE_RE = re.compile(r'[?&]page=(\d+)', re.I)
 PAGE_WORKERS = 4
+FETCH_TIMEOUT = 45
+BROWSER_TIMEOUT_MS = 90000
 
 
-def fetch(url, retries=3):
+class FetchBlockedError(Exception):
+    """すべての回避ルートが失敗した場合に送出する。"""
+
+    def __init__(self, message='すべての回避ルートがブロックされました', status=403, attempts=None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.attempts = attempts or []
+
+
+def _referer(url):
+    parsed = urlparse(url)
+    return f'{parsed.scheme}://{parsed.netloc}/'
+
+
+def _looks_blocked(status_code, html):
+    if status_code in (403, 429, 503):
+        return True
+    if not html or len(html.strip()) < 300:
+        return True
+    lower = html.lower()
+    hits = sum(1 for p in BLOCK_PATTERNS if p in lower)
+    if hits >= 2:
+        return True
+    if 'just a moment' in lower or 'cf-browser-verification' in lower:
+        return True
+    return False
+
+
+def _decode_response(r):
+    r.encoding = r.apparent_encoding or 'utf-8'
+    return r.text
+
+
+def _attempt_record(route, ok, detail=''):
+    return {'route': route, 'ok': ok, 'detail': detail}
+
+
+def _fetch_requests(url):
+    headers = {'User-Agent': UA, 'Referer': _referer(url), 'Accept-Language': 'ja,en;q=0.9'}
+    r = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT)
+    html = _decode_response(r)
+    if _looks_blocked(r.status_code, html):
+        raise requests.HTTPError(f'blocked ({r.status_code})', response=r)
+    r.raise_for_status()
+    return html
+
+
+def _get_cloudscraper(variant='safari_ios'):
+    import cloudscraper
+
+    if variant == 'chrome':
+        return cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True},
+        )
+    return cloudscraper.create_scraper(
+        browser={'browser': 'safari', 'platform': 'ios', 'mobile': True},
+    )
+
+
+def _fetch_cloudscraper(url):
+    last_err = None
+    for variant in ('safari_ios', 'chrome'):
+        try:
+            scraper = _get_cloudscraper(variant)
+            headers = {'Referer': _referer(url), 'Accept-Language': 'ja,en;q=0.9'}
+            ua = UA_SAFARI_IOS if variant == 'safari_ios' else UA_CHROME
+            headers['User-Agent'] = ua
+            r = scraper.get(url, headers=headers, timeout=FETCH_TIMEOUT)
+            html = _decode_response(r)
+            if _looks_blocked(r.status_code, html):
+                raise requests.HTTPError(f'blocked ({r.status_code})', response=r)
+            r.raise_for_status()
+            return html
+        except Exception as e:
+            last_err = e
+            log.warning('cloudscraper/%s failed for %s: %s', variant, url, e)
+    raise last_err
+
+
+def _proxy_routes(target_url):
+    encoded = quote(target_url, safe='')
+    routes = [('allorigins', f'https://api.allorigins.win/raw?url={encoded}')]
+
+    scraper_key = os.environ.get('SCRAPER_API_KEY', '').strip()
+    if scraper_key:
+        routes.append((
+            'scraperapi',
+            f'http://api.scraperapi.com?api_key={scraper_key}&url={encoded}',
+        ))
+
+    crawlbase_token = os.environ.get('CRAWLBASE_TOKEN', '').strip()
+    if crawlbase_token:
+        routes.append((
+            'crawlbase',
+            f'https://api.crawlbase.com/?token={crawlbase_token}&url={encoded}',
+        ))
+
+    return routes
+
+
+def _fetch_via_proxy(proxy_name, proxy_url, target_url):
+    headers = {
+        'User-Agent': UA,
+        'Referer': _referer(target_url),
+        'Accept-Language': 'ja,en;q=0.9',
+    }
+    r = requests.get(proxy_url, headers=headers, timeout=FETCH_TIMEOUT + 15)
+    html = _decode_response(r)
+    if _looks_blocked(r.status_code, html):
+        raise requests.HTTPError(f'proxy blocked ({r.status_code}) via {proxy_name}', response=r)
+    r.raise_for_status()
+    return html
+
+
+def _fetch_proxies(target_url):
+    last_err = None
+    for name, proxy_url in _proxy_routes(target_url):
+        try:
+            return _fetch_via_proxy(name, proxy_url, target_url)
+        except Exception as e:
+            last_err = e
+            log.warning('proxy/%s failed for %s: %s', name, target_url, e)
+    raise last_err
+
+
+def _fetch_playwright(url):
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=['--disable-blink-features=AutomationControlled', '--no-sandbox'],
+        )
+        try:
+            context = browser.new_context(
+                user_agent=UA,
+                viewport={'width': 390, 'height': 844},
+                is_mobile=True,
+                locale='ja-JP',
+            )
+            page = context.new_page()
+            page.goto(url, wait_until='domcontentloaded', timeout=BROWSER_TIMEOUT_MS)
+            page.wait_for_timeout(2500)
+            html = page.content()
+            if _looks_blocked(200, html):
+                raise RuntimeError('playwright: challenge page detected')
+            return html
+        finally:
+            browser.close()
+
+
+def _fetch_undetected_chrome(url):
+    import undetected_chromedriver as uc
+
+    options = uc.ChromeOptions()
+    options.add_argument('--headless=new')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument(f'--user-agent={UA}')
+    driver = uc.Chrome(options=options, use_subprocess=True)
+    try:
+        driver.set_page_load_timeout(60)
+        driver.get(url)
+        time.sleep(3)
+        html = driver.page_source
+        if _looks_blocked(200, html):
+            raise RuntimeError('undetected-chromedriver: challenge page detected')
+        return html
+    finally:
+        driver.quit()
+
+
+def _fetch_browser(url):
+    errors = []
+    try:
+        return _fetch_playwright(url)
+    except Exception as e:
+        errors.append(f'playwright: {e}')
+        log.warning('playwright failed for %s: %s', url, e)
+
+    try:
+        return _fetch_undetected_chrome(url)
+    except Exception as e:
+        errors.append(f'undetected-chromedriver: {e}')
+        log.warning('undetected-chromedriver failed for %s: %s', url, e)
+
+    raise RuntimeError('; '.join(errors) or 'browser fallback unavailable')
+
+
+def fetch_html(url):
+    """
+    条件分岐型突破エンジン:
+      1. requests → 403等なら cloudscraper へ
+      2. データセンターIPブロックなら CORS/スクレイピングAPI プロキシへ
+      3. 最終手段: Playwright / undetected-chromedriver ヘッドレス
+    """
+    attempts = []
+    status_hint = 403
+
+    # --- ケース1: 通常 requests → Bot検知(403)なら cloudscraper ---
+    try:
+        html = _fetch_requests(url)
+        attempts.append(_attempt_record('requests', True))
+        return html, 'requests'
+    except Exception as e:
+        detail = str(e)
+        attempts.append(_attempt_record('requests', False, detail))
+        resp = getattr(e, 'response', None)
+        if resp is not None:
+            status_hint = getattr(resp, 'status_code', status_hint)
+        log.info('requests blocked for %s → trying cloudscraper (%s)', url, detail)
+
+    try:
+        html = _fetch_cloudscraper(url)
+        attempts.append(_attempt_record('cloudscraper', True))
+        return html, 'cloudscraper'
+    except Exception as e:
+        detail = str(e)
+        attempts.append(_attempt_record('cloudscraper', False, detail))
+        resp = getattr(e, 'response', None)
+        if resp is not None:
+            status_hint = getattr(resp, 'status_code', status_hint)
+        log.info('cloudscraper blocked for %s → trying proxies (%s)', url, detail)
+
+    # --- ケース2: Render等 DC IP ブロック → 外部プロキシ経由 ---
+    try:
+        html = _fetch_proxies(url)
+        attempts.append(_attempt_record('proxy', True))
+        return html, 'proxy'
+    except Exception as e:
+        detail = str(e)
+        attempts.append(_attempt_record('proxy', False, detail))
+        log.info('proxies blocked for %s → trying browser (%s)', url, detail)
+
+    # --- ケース3: 最終手段 → ステルスヘッドレスブラウザ ---
+    try:
+        html = _fetch_browser(url)
+        attempts.append(_attempt_record('browser', True))
+        return html, 'browser'
+    except Exception as e:
+        detail = str(e)
+        attempts.append(_attempt_record('browser', False, detail))
+        log.error('all bypass routes failed for %s: %s', url, detail)
+
+    raise FetchBlockedError(status=status_hint, attempts=attempts)
+
+
+def fetch(url, retries=1):
+    """HTML取得 → BeautifulSoup へ変換（既存パース処理へ引き渡し）。"""
     last_err = None
     for attempt in range(retries):
         try:
-            r = requests.get(url, headers={'User-Agent': UA, 'Referer': url}, timeout=45)
-            r.raise_for_status()
-            r.encoding = r.apparent_encoding or 'utf-8'
-            return BeautifulSoup(r.text, 'html.parser')
-        except requests.RequestException as e:
+            html, route = fetch_html(url)
+            if attempt == 0:
+                log.debug('fetch OK via %s: %s', route, url)
+            return BeautifulSoup(html, 'html.parser')
+        except FetchBlockedError:
+            raise
+        except Exception as e:
             last_err = e
             if attempt < retries - 1:
                 time.sleep(1 + attempt)
+    if isinstance(last_err, FetchBlockedError):
+        raise last_err
     raise last_err
 
 
@@ -382,10 +655,35 @@ def extract():
 
         print(f'OK [{mode}] {url} → {len(out.get("items") or out.get("images") or [])} items')
         return jsonify(out)
+    except FetchBlockedError as e:
+        return jsonify({
+            'error': e.message,
+            'status': e.status,
+            'message': e.message,
+            'attempts': e.attempts,
+        }), e.status
     except ValueError as e:
         return jsonify({'error': str(e)}), 404
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+def _fetch_image_bytes(url):
+    """画像プロキシ用: 突破エンジンでHTML取得ルートを簡略再利用。"""
+    headers = {'User-Agent': UA, 'Referer': _referer(url)}
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code == 403:
+            raise requests.HTTPError('403', response=r)
+        r.raise_for_status()
+        return r.content, r.headers.get('Content-Type', 'image/jpeg').split(';')[0]
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 403:
+            scraper = _get_cloudscraper('safari_ios')
+            r = scraper.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            return r.content, r.headers.get('Content-Type', 'image/jpeg').split(';')[0]
+        raise
 
 
 @app.route('/proxy')
@@ -394,19 +692,11 @@ def proxy_image():
     if not raw.startswith(('http://', 'https://')):
         return jsonify({'error': '有効な url パラメータが必要です'}), 400
     try:
-        parsed = urlparse(raw)
-        referer = f'{parsed.scheme}://{parsed.netloc}/'
-        r = requests.get(
-            raw,
-            headers={'User-Agent': UA, 'Referer': referer},
-            timeout=30,
-        )
-        r.raise_for_status()
-        ct = r.headers.get('Content-Type', 'image/jpeg').split(';')[0]
+        content, ct = _fetch_image_bytes(raw)
         if not ct.startswith('image/'):
             ct = 'image/jpeg'
         return Response(
-            r.content,
+            content,
             status=200,
             content_type=ct,
             headers={'Cache-Control': 'public, max-age=86400'},
