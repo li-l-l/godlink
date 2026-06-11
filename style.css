@@ -103,6 +103,12 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,sans-serif;ba
 .page-video{display:block;width:100%;max-height:85vh;background:#000}
 .page.video-page{margin-bottom:8px}
 .page figcaption{display:none}
+.reader-ch-nav{display:flex;gap:8px;padding:16px 12px 28px;background:linear-gradient(transparent,#000 30%);position:sticky;bottom:0}
+.rcnav-btn{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;min-height:44px;padding:10px 8px;border:none;border-radius:12px;background:rgba(255,255,255,.12);color:#fff;font-size:12px;font-weight:600;cursor:pointer;-webkit-tap-highlight-color:transparent}
+.rcnav-btn span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:9em}
+.rcnav-btn:active:not(:disabled){background:rgba(255,255,255,.22)}
+.rcnav-btn:disabled{opacity:.35;cursor:default}
+.rcnav-mid{flex:0 0 auto;min-width:72px;background:rgba(92,184,92,.35)}
 
 /* fav/hist */
 .frow{display:flex;align-items:center;gap:12px;background:var(--w);border:1px solid var(--bd);border-radius:12px;padding:10px 12px;margin-bottom:8px;cursor:pointer}

@@ -606,18 +606,55 @@ function hdr(title, opts = {}) {
 }
 
 function searchBar(id, placeholder, value = '') {
-    return `<div class="srch"><div class="sbox"><i class="fa-solid fa-magnifying-glass"></i><input id="${id}" placeholder="${esc(placeholder)}" value="${esc(value)}"><button class="sclear ${value ? '' : 'hidden'}" type="button" data-for="${id}"><i class="fa-solid fa-xmark"></i></button></div></div>`;
+    return `<div class="srch"><div class="sbox"><i class="fa-solid fa-magnifying-glass"></i><input id="${id}" type="search" enterkeyhint="search" autocomplete="off" autocorrect="off" placeholder="${esc(placeholder)}" value="${esc(value)}"><button class="sclear ${value ? '' : 'hidden'}" type="button" data-for="${id}"><i class="fa-solid fa-xmark"></i></button></div></div>`;
 }
 
 function bindSearch(inputId, onChange) {
     const input = $(`#${inputId}`);
     if (!input) return;
     const clear = input.parentElement.querySelector('.sclear');
-    input.oninput = () => {
+    let composing = false;
+    let debounceTimer = null;
+
+    const apply = () => {
+        clearTimeout(debounceTimer);
+        const pos = input.selectionStart;
         clear?.classList.toggle('hidden', !input.value);
         onChange(input.value.trim());
+        requestAnimationFrame(() => {
+            const el = $(`#${inputId}`);
+            if (!el) return;
+            el.focus({ preventScroll: true });
+            try {
+                const p = Math.min(pos ?? el.value.length, el.value.length);
+                el.setSelectionRange(p, p);
+            } catch { /* mobile */ }
+        });
     };
+
+    input.addEventListener('compositionstart', () => { composing = true; });
+    input.addEventListener('compositionend', () => {
+        composing = false;
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(apply, 300);
+    });
+    input.addEventListener('input', () => {
+        clear?.classList.toggle('hidden', !input.value);
+        if (composing) return;
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(apply, 450);
+    });
+    input.addEventListener('keydown', e => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            apply();
+        }
+    });
+    input.addEventListener('search', () => {
+        if (!input.value) apply();
+    });
     clear?.addEventListener('click', () => {
+        clearTimeout(debounceTimer);
         input.value = '';
         clear.classList.add('hidden');
         onChange('');
@@ -943,12 +980,16 @@ function showChapters(proj, manga, data) {
 
     $('#nav-back').onclick = popNav;
     bindSearch('ch-q', q => { chapterQ = q; showChapters(proj, manga, data); });
-    $('#read-latest')?.addEventListener('click', () => openReader(proj, manga, latest));
-    $$('.chrow').forEach(r => r.onclick = () => openReader(proj, manga, filtered[+r.dataset.i]));
+    const openChapter = (ch) => {
+        const idx = data.items.findIndex(c => c.url === ch.url);
+        openReader(proj, manga, ch, { chapters: data.items, chapterIndex: idx >= 0 ? idx : 0 });
+    };
+    $('#read-latest')?.addEventListener('click', () => openChapter(latest));
+    $$('.chrow').forEach(r => r.onclick = () => openChapter(filtered[+r.dataset.i]));
 }
 
 /* ── ③ 縦読み / 動画 ── */
-async function openReader(proj, manga, chapter) {
+async function openReader(proj, manga, chapter, ctx = {}) {
     loading(`「${chapter.title}」を読み込み...`, '漫画URLのみ取得 · 画像は CDN 直叩き');
     try {
         const data = await extract({
@@ -956,8 +997,14 @@ async function openReader(proj, manga, chapter) {
             mode: 'media',
             selector_media: proj.selectorMedia,
         });
-        pushNav(() => showReader(data, manga, chapter, () => popNav()));
-        showReader(data, manga, chapter, () => popNav());
+        const readerCtx = { ...ctx, proj };
+        const mount = () => showReader(data, manga, chapter, () => popNav(), readerCtx);
+        if (ctx.replace) {
+            nav[nav.length - 1] = mount;
+            mount();
+        } else {
+            pushNav(mount);
+        }
         hist.unshift({
             type: 'read',
             title: `${manga.title} ${chapter.title}`,
@@ -973,8 +1020,12 @@ async function openReader(proj, manga, chapter) {
     } catch (e) { err(e.message); }
 }
 
-function showReader(data, manga, chapter, back) {
+function showReader(data, manga, chapter, back, ctx = {}) {
     screen.className = 'black';
+    const { chapters, chapterIndex, proj } = ctx;
+    const idx = chapterIndex ?? -1;
+    const prevCh = chapters && idx >= 0 && idx < chapters.length - 1 ? chapters[idx + 1] : null;
+    const nextCh = chapters && idx > 0 ? chapters[idx - 1] : null;
 
     let body = '';
     if (data.videos?.length) {
@@ -990,6 +1041,19 @@ function showReader(data, manga, chapter, back) {
         ).join('');
     }
 
+    const chNav = chapters?.length ? `
+            <div class="reader-ch-nav">
+                <button type="button" class="rcnav-btn" id="ch-prev"${prevCh ? '' : ' disabled'}>
+                    <i class="fa-solid fa-chevron-left"></i><span>${prevCh ? esc(prevCh.title) : '前の話'}</span>
+                </button>
+                <button type="button" class="rcnav-btn rcnav-mid" id="ch-list">
+                    <i class="fa-solid fa-list"></i><span>一覧</span>
+                </button>
+                <button type="button" class="rcnav-btn" id="ch-next"${nextCh ? '' : ' disabled'}>
+                    <span>${nextCh ? esc(nextCh.title) : '次の話'}</span><i class="fa-solid fa-chevron-right"></i>
+                </button>
+            </div>` : '';
+
     screen.innerHTML = `
         <div class="reader-wrap">
             <div class="vhead" id="vhead">
@@ -1001,10 +1065,19 @@ function showReader(data, manga, chapter, back) {
                 <span id="page-ind">1 / ${data.count}P</span>
             </div>
             <div class="read-progress"><div class="read-progress-bar" id="rpbar"></div></div>
-            <div class="vscroll" id="vscroll">${body}</div>
+            <div class="vscroll" id="vscroll">${body}${chNav}</div>
         </div>`;
 
     $('#vb').onclick = back;
+    $('#ch-list')?.addEventListener('click', back);
+    $('#ch-prev')?.addEventListener('click', () => {
+        if (!prevCh || !proj) return;
+        openReader(proj, manga, prevCh, { chapters, chapterIndex: idx + 1, replace: true });
+    });
+    $('#ch-next')?.addEventListener('click', () => {
+        if (!nextCh || !proj) return;
+        openReader(proj, manga, nextCh, { chapters, chapterIndex: idx - 1, replace: true });
+    });
     bindImages();
     $$('.page-video').forEach(v => {
         v.onerror = () => {
@@ -1035,7 +1108,7 @@ function showReader(data, manga, chapter, back) {
     updateProgress();
 
     scroll.addEventListener('click', e => {
-        if (e.target.closest('.back') || e.target.closest('a') || e.target.closest('video')) return;
+        if (e.target.closest('.back') || e.target.closest('a') || e.target.closest('video') || e.target.closest('.reader-ch-nav')) return;
         headVisible = !headVisible;
         $('#vhead').classList.toggle('hidden-head', !headVisible);
         $('.read-progress')?.classList.toggle('hidden-head', !headVisible);
