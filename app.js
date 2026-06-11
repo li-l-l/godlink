@@ -4,8 +4,6 @@ const API_BASE = (() => {
     if (location.protocol !== 'file:') return location.origin;
     return 'http://127.0.0.1:5000';
 })();
-let API = `${API_BASE}/extract`;
-let PROXY = `${API_BASE}/proxy`;
 
 function refreshApiUrls() {
     const base = (() => {
@@ -14,12 +12,38 @@ function refreshApiUrls() {
         if (location.protocol !== 'file:') return location.origin;
         return 'http://127.0.0.1:5000';
     })();
-    API = `${base}/extract`;
+    RELAY = `${base}/relay`;
     PROXY = `${base}/proxy`;
     return base;
 }
-const STORE_VER = 'rx-v6';
+
+let RELAY = `${API_BASE}/relay`;
+let PROXY = `${API_BASE}/proxy`;
+let RX_CONFIG = { mode: 'client-direct', cfWorker: localStorage.getItem('rx-cf-worker') || '' };
+
+const STORE_VER = 'rx-v7';
 const INDEX_BATCH = 60;
+
+const SITE_UA = (
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
+    'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+);
+
+const IMG_ATTRS = ['data-src', 'data-lazy-src', 'data-original', 'src', 'data-url', 'data-lazy', 'data-echo'];
+const PLACEHOLDER_HINTS = ['lazy.jpg', 'mangaraw-lazy', 'placeholder', '1x1.gif', 'blank.gif', 'loading.gif', 'spacer.gif', 'pixel.gif'];
+const SKIP_IMG = ['avatar', 'logo', 'emoji', 'icon', 'banner', 'adservice', 'doubleclick', 'popads', 'exoclick', 'juicyads', 'clickadu'];
+const JUNK_MEDIA = ['adservice', 'doubleclick', 'popads', 'exoclick', 'juicyads', 'clickadu', 'banner', 'affiliate', '/ad/', '/ads/'];
+const BLOCK_PATTERNS = [
+    '<title>just a moment', 'cf-browser-verification', 'checking your browser before accessing',
+    'checking your browser', 'access denied', 'enable javascript and cookies to continue',
+    'attention required! | cloudflare',
+];
+const VALID_HINTS = ['manga-vertical', 'manga-list', 'mgcdn', 'mangaraw', 'di-1hua'];
+const AD_SELECTORS = [
+    'script', 'iframe', 'noscript', 'embed', 'object', 'ins', 'aside',
+    '.ads', '.ad', '.advert', '.banner-ad', '[class*="ad-"]', '[id*="ad-"]',
+    '[class*="popup"]', '[class*="popunder"]',
+];
 
 const BUILTIN = [{
     id: 'mangaraw',
@@ -57,7 +81,7 @@ let indexLoadToken = 0;
 let indexView = null;
 let favs = JSON.parse(localStorage.getItem('rx-fav') || '[]');
 let hist = JSON.parse(localStorage.getItem('rx-hist') || '[]');
-let useProxy = localStorage.getItem('rx-proxy') !== '0';
+let useProxy = localStorage.getItem('rx-proxy') === '1';
 
 function initProjects() {
     if (localStorage.getItem('rx-ver') !== STORE_VER) {
@@ -74,6 +98,346 @@ function saveHist() { localStorage.setItem('rx-hist', JSON.stringify(hist.slice(
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+/* ── クライアント側 HTML 取得（Safari 直撃 → CF Worker → /relay） ── */
+function cfWorkerUrl() {
+    return (localStorage.getItem('rx-cf-worker') || RX_CONFIG.cfWorker || '').replace(/\/$/, '');
+}
+
+async function loadRemoteConfig() {
+    try {
+        const r = await fetch(`${refreshApiUrls()}/config`);
+        if (!r.ok) return;
+        RX_CONFIG = await r.json();
+        if (RX_CONFIG.cfWorker && !localStorage.getItem('rx-cf-worker')) {
+            localStorage.setItem('rx-cf-worker', RX_CONFIG.cfWorker);
+        }
+    } catch { /* offline / local */ }
+}
+
+function looksBlocked(status, html) {
+    if (status === 403 || status === 429 || status === 503) return true;
+    if (!html || html.trim().length < 300) return true;
+    const lower = html.toLowerCase();
+    if (BLOCK_PATTERNS.some(p => lower.includes(p))) return true;
+    if (status === 200 && VALID_HINTS.some(h => lower.includes(h))) return false;
+    return lower.includes('just a moment') && lower.includes('cloudflare');
+}
+
+async function fetchPage(url) {
+    const htmlHeaders = {
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    };
+
+    // ① Safari 直撃（iPhone 回線 IP — CORS 許可サイトのみ成功）
+    try {
+        const r = await fetch(url, { mode: 'cors', credentials: 'omit', redirect: 'follow', headers: htmlHeaders });
+        if (r.ok) {
+            const html = await r.text();
+            if (!looksBlocked(r.status, html)) return { html, route: 'safari-direct' };
+        }
+    } catch { /* mangaraw 等は CORS 拒否が通常 */ }
+
+    // ② Cloudflare Worker（クライアント → Worker、Render 帯域ゼロ・無料 API 不使用）
+    const cf = cfWorkerUrl();
+    if (cf) {
+        const r = await fetch(`${cf}?url=${encodeURIComponent(url)}`, { credentials: 'omit' });
+        if (r.ok) {
+            const html = await r.text();
+            if (!looksBlocked(r.status, html)) return { html, route: 'cf-worker' };
+        }
+    }
+
+    // ③ 自宅 PC /relay（一般回線 IP + CORS 付与）
+    try {
+        const r = await fetch(`${RELAY}?url=${encodeURIComponent(url)}`, { credentials: 'omit' });
+        if (r.ok) {
+            const html = await r.text();
+            if (!looksBlocked(r.status, html)) return { html, route: 'relay' };
+        }
+    } catch { /* ignore */ }
+
+    throw new Error(
+        'ページを取得できませんでした。\n\n' +
+        'Settings → Cloudflare Worker URL を設定するか、\n' +
+        '自宅 PC で python extractor.py を起動してください。'
+    );
+}
+
+/* ── クライアント側 DOM 解析（広告除去 → 純粋 URL 抽出） ── */
+function stripAds(doc) {
+    AD_SELECTORS.forEach(sel => doc.querySelectorAll(sel).forEach(el => el.remove()));
+}
+
+function parseDoc(html) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    stripAds(doc);
+    return doc;
+}
+
+function absUrl(base, href) {
+    if (!href) return null;
+    try { return new URL(href, base).href; } catch { return null; }
+}
+
+function isPlaceholder(url) {
+    if (!url) return true;
+    const s = url.trim().toLowerCase();
+    if (s.startsWith('data:')) return true;
+    return PLACEHOLDER_HINTS.some(h => s.includes(h));
+}
+
+function isJunkMedia(url) {
+    if (!url) return true;
+    const s = url.toLowerCase();
+    return JUNK_MEDIA.some(j => s.includes(j));
+}
+
+function imgUrl(el, base) {
+    if (!el) return null;
+    for (const attr of IMG_ATTRS) {
+        const val = el.getAttribute(attr);
+        if (val && !isPlaceholder(val)) return absUrl(base, val.trim());
+    }
+    for (const attr of ['srcset', 'data-srcset']) {
+        const ss = el.getAttribute(attr);
+        if (ss) {
+            const part = ss.split(',').pop().trim().split(/\s+/)[0];
+            if (part && !isPlaceholder(part)) return absUrl(base, part);
+        }
+    }
+    if (el.tagName !== 'IMG') return imgUrl(el.querySelector('img'), base);
+    return null;
+}
+
+function linkOf(el, base) {
+    if (!el) return { href: null, text: '' };
+    const href = el.getAttribute('href');
+    const text = (el.textContent || el.getAttribute('title') || el.getAttribute('aria-label') || '').trim();
+    if (!href || href.startsWith('#') || href.toLowerCase().startsWith('javascript:')) {
+        return { href: null, text };
+    }
+    return { href: absUrl(base, href.trim()), text };
+}
+
+function cleanTitle(text) {
+    if (!text) return '無題';
+    return text.replace(/\b(19|20)\d{2}\b/g, '').replace(/\s+/g, ' ').trim().replace(/^[\s\-|·]+|[\s\-|·]+$/g, '') || '無題';
+}
+
+function yearOf(text) {
+    const m = (text || '').match(/\b(19|20)\d{2}\b/);
+    return m ? m[0] : '';
+}
+
+function chapterNum(text, url = '') {
+    let m = (text || '').match(/第?\s*(\d+)\s*話|di-(\d+)hua/i);
+    if (m) return parseInt(m[1] || m[2] || '0', 10);
+    m = (url || '').match(/di-(\d+)hua/i);
+    return m ? parseInt(m[1], 10) : 0;
+}
+
+function titleOf(doc, url) {
+    const h1 = doc.querySelector('h1');
+    if (h1) return h1.textContent.trim();
+    const t = doc.querySelector('title');
+    if (t) return t.textContent.split('-')[0].trim();
+    try { return new URL(url).pathname; } catch { return ''; }
+}
+
+function isPageImage(src) {
+    if (!src || isJunkMedia(src)) return false;
+    const s = src.toLowerCase();
+    if (SKIP_IMG.some(x => s.includes(x))) return false;
+    if (s.includes('mgcdn') || /\/\d+\.(jpg|jpeg|png|webp)(\?|$)/i.test(s)) return true;
+    if (s.includes('storage/images/covers')) return false;
+    return s.includes('blogger.googleusercontent.com/img/') && !s.includes('avatar');
+}
+
+function isPageVideo(src) {
+    if (!src || isJunkMedia(src)) return false;
+    const s = src.toLowerCase();
+    return /\.(m3u8|mp4|webm)(\?|$)/i.test(s) || (s.includes('/video/') && !s.includes('ad'));
+}
+
+function listBaseUrl(url) {
+    const u = new URL(url);
+    u.searchParams.delete('page');
+    return u.href;
+}
+
+function pageUrl(baseUrl, pageNum) {
+    const u = new URL(baseUrl);
+    u.searchParams.set('page', String(pageNum));
+    return u.href;
+}
+
+function detectMaxPage(doc) {
+    let maxP = 1;
+    doc.querySelectorAll('a[href]').forEach(a => {
+        const href = a.getAttribute('href') || '';
+        if (!href.toLowerCase().includes('page=')) return;
+        for (const m of href.matchAll(/[?&]page=(\d+)/gi)) {
+            maxP = Math.max(maxP, parseInt(m[1], 10));
+        }
+    });
+    return maxP;
+}
+
+function parseCard(card, base, imgSel, linkSel) {
+    const imgEl = imgSel ? card.querySelector(imgSel) : card.querySelector('img');
+    const thumb = imgUrl(imgEl, base);
+    let name = imgEl?.getAttribute('alt') || '';
+
+    let linkEl = linkSel ? card.querySelector(linkSel) : null;
+    if (!linkEl) linkEl = card.querySelector('a[href^="/raw/"]') || card.querySelector('a[href]');
+    let { href: detail, text: linkText } = linkOf(linkEl, base);
+    if (!name) name = linkText || (card.textContent || '').trim().slice(0, 80);
+
+    const tEl = card.querySelector('.latest-chapter a, h2 a');
+    if (tEl) {
+        const { text: t2 } = linkOf(tEl, base);
+        if (t2) name = name || t2;
+    }
+    if (!detail) {
+        for (const a of card.querySelectorAll('a[href]')) {
+            const href = a.getAttribute('href') || '';
+            if (href.startsWith('/raw/') && !href.includes('di-')) {
+                ({ href: detail } = linkOf(a, base));
+                break;
+            }
+        }
+    }
+    if (!detail && !thumb) return null;
+    return { title: cleanTitle(name), url: detail, thumbnail: thumb, year: yearOf(name) };
+}
+
+function parseCards(doc, base, cardSel, imgSel, linkSel) {
+    return [...doc.querySelectorAll(cardSel)]
+        .map(card => parseCard(card, base, imgSel, linkSel))
+        .filter(Boolean);
+}
+
+async function extractIndex(req) {
+    const { url, selector_card: cardSel, selector_img: imgSel, selector_link: linkSel, paginate, page } = req;
+    const base = listBaseUrl(url);
+
+    if (paginate && page != null) {
+        const pageLink = pageUrl(base, Math.max(1, parseInt(page, 10)));
+        const { html } = await fetchPage(pageLink);
+        const doc = parseDoc(html);
+        if (!doc.querySelector(cardSel)) throw new Error(`ページ ${page} に作品がありません`);
+        const items = parseCards(doc, pageLink, cardSel, imgSel, linkSel);
+        return {
+            mode: 'index',
+            title: titleOf(doc, pageLink),
+            source_url: base,
+            items,
+            count: items.length,
+            page: parseInt(page, 10),
+            total_pages: parseInt(page, 10) === 1 ? detectMaxPage(doc) : null,
+        };
+    }
+
+    const firstUrl = pageUrl(base, 1);
+    const { html } = await fetchPage(firstUrl);
+    const doc = parseDoc(html);
+    if (!doc.querySelector(cardSel)) throw new Error(`作品が見つかりません: ${cardSel}`);
+
+    const items = parseCards(doc, firstUrl, cardSel, imgSel, linkSel);
+    const totalPages = paginate ? detectMaxPage(doc) : 1;
+    if (!items.length) throw new Error('有効な作品データがありません');
+
+    return {
+        mode: 'index',
+        title: titleOf(doc, firstUrl),
+        source_url: base,
+        items,
+        count: items.length,
+        total_pages: totalPages,
+    };
+}
+
+async function extractChapters(req) {
+    const { url, selector_chapter: linkSel } = req;
+    const { html } = await fetchPage(url);
+    const doc = parseDoc(html);
+    const selector = linkSel || 'main a[href*="di-"][href*="hua"]';
+    const anchors = doc.querySelectorAll(selector);
+    if (!anchors.length) throw new Error('話数リンクが見つかりません');
+
+    const mangaPath = new URL(url).pathname.replace(/\/$/, '');
+    const seen = new Set();
+    const items = [];
+
+    anchors.forEach(a => {
+        const { href, text } = linkOf(a, url);
+        if (!href || seen.has(href)) return;
+        if (mangaPath && !new URL(href).pathname.includes(mangaPath)) return;
+        seen.add(href);
+        const num = chapterNum(text, href);
+        items.push({ title: cleanTitle(text) || `第${num}話`, url: href, thumbnail: null, year: '', number: num });
+    });
+
+    items.sort((a, b) => b.number - a.number);
+    if (!items.length) throw new Error('話数を抽出できませんでした');
+    return { mode: 'chapters', title: titleOf(doc, url), source_url: url, items };
+}
+
+async function extractMedia(req) {
+    const { url, selector_media: mediaSel } = req;
+    const { html } = await fetchPage(url);
+    const doc = parseDoc(html);
+    const selector = mediaSel || 'main img';
+    const elements = doc.querySelectorAll(selector);
+
+    const seen = new Set();
+    const images = [];
+    const videos = [];
+
+    elements.forEach(el => {
+        const u = imgUrl(el, url);
+        if (!u || seen.has(u)) return;
+        if (!isPageImage(u)) return;
+        seen.add(u);
+        images.push(u);
+    });
+
+    doc.querySelectorAll('video source[src], video[src]').forEach(el => {
+        const u = absUrl(url, el.getAttribute('src'));
+        if (!u || seen.has(u) || !isPageVideo(u)) return;
+        seen.add(u);
+        videos.push(u);
+    });
+
+    if (!images.length && !videos.length) throw new Error('本編メディアを取得できませんでした（広告除外後0件）');
+
+    images.sort((a, b) => {
+        const ma = a.match(/\/(\d+)\.(jpg|jpeg|png|webp)/i);
+        const mb = b.match(/\/(\d+)\.(jpg|jpeg|png|webp)/i);
+        return (ma ? parseInt(ma[1], 10) : 0) - (mb ? parseInt(mb[1], 10) : 0);
+    });
+
+    return {
+        mode: 'media',
+        type: videos.length && !images.length ? 'video' : 'gallery',
+        title: titleOf(doc, url),
+        source_url: url,
+        images,
+        videos,
+        count: images.length || videos.length,
+    };
+}
+
+async function extract(req) {
+    const mode = (req.mode || '').toLowerCase();
+    if (mode === 'index') return extractIndex(req);
+    if (mode === 'chapters') return extractChapters(req);
+    if (mode === 'media') return extractMedia(req);
+    throw new Error('mode は index / chapters / media');
+}
+
+/* ── キャッシュ ── */
 function cacheId(s) {
     let h = 0;
     for (let i = 0; i < (s || '').length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
@@ -128,7 +492,6 @@ function formatCacheTime(ts) {
     return new Date(ts).toLocaleString('ja-JP', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-
 function esc(t) { const d = document.createElement('div'); d.textContent = t ?? ''; return d.innerHTML; }
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 5); }
 
@@ -151,6 +514,10 @@ function imgSrc(url) {
     return useProxy ? proxyUrl(url) : url;
 }
 
+function mediaSrc(url) {
+    return imgSrc(url);
+}
+
 function noImg() {
     return '<div class="no-img"><i class="fa-regular fa-image"></i></div>';
 }
@@ -158,23 +525,18 @@ function noImg() {
 function imgHtml(url, cls = '', alt = '') {
     if (!url) return noImg();
     const direct = esc(url);
-    const src = esc(imgSrc(url));
-    return `<img class="rx-img ${cls}" src="${src}" data-direct="${direct}" data-proxy="${esc(proxyUrl(url))}" alt="${esc(alt)}" loading="lazy">`;
+    const src = esc(mediaSrc(url));
+    return `<img class="rx-img ${cls}" src="${src}" data-direct="${direct}" data-proxy="${esc(proxyUrl(url))}" alt="${esc(alt)}" loading="lazy" decoding="async">`;
 }
 
 function bindImages(root = screen) {
     $$('.rx-img', root).forEach(img => {
         img.onerror = () => {
-            if (img.dataset.failed) {
+            if (img.dataset.failed === '1') {
                 img.replaceWith(Object.assign(document.createElement('div'), {
                     className: 'no-img',
                     innerHTML: '<i class="fa-regular fa-image"></i>',
                 }));
-                return;
-            }
-            if (img.src !== img.dataset.direct && img.dataset.direct) {
-                img.dataset.failed = 'retry';
-                img.src = img.dataset.direct;
                 return;
             }
             if (img.dataset.proxy && img.src !== img.dataset.proxy) {
@@ -202,26 +564,6 @@ function toggleFav(item, proj) {
         toast('お気に入りに追加しました', 'ok');
     }
     saveFav();
-}
-
-async function call(body) {
-    let r;
-    try {
-        r = await fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    } catch {
-        throw new Error('サーバーに接続できません。extractor.py を起動し、http://127.0.0.1:5000 を開いてください');
-    }
-    const d = await r.json();
-    if (!r.ok || d.error) {
-        let msg = d.message || d.error || '通信エラー';
-        if (d.attempts?.length) {
-            const failed = d.attempts.filter(a => !a.ok).map(a => a.route).join(' → ');
-            if (failed) msg += `\n\n試行: ${failed}`;
-        }
-        if (d.hint) msg += `\n\n${d.hint}`;
-        throw new Error(msg);
-    }
-    return d;
 }
 
 function loading(msg = '読み込み中...', sub = '') {
@@ -312,7 +654,7 @@ function indexBody(proj, page) {
 }
 
 async function fetchIndexPage(proj, page) {
-    return call(indexBody(proj, page));
+    return extract(indexBody(proj, page));
 }
 
 function mergeIndexItems(data, incoming) {
@@ -415,7 +757,7 @@ async function fetchIndexFresh(proj, token) {
         data.pagesLoaded = 1;
         data.complete = !data.loading;
     } else {
-        data = await call(indexBody(proj));
+        data = await extract(indexBody(proj));
         data.loading = false;
         data.complete = true;
     }
@@ -435,7 +777,7 @@ async function refreshProject(proj) {
     indexQ = '';
     indexVisible = INDEX_BATCH;
     indexLoadToken += 1;
-    loading('作品一覧を更新中...', '更新ボタンでのみネット取得します');
+    loading('作品一覧を更新中...', 'Safari / CF Worker 経由で取得');
     try {
         await fetchIndexFresh(proj, indexLoadToken);
     } catch (e) { err(e.message); }
@@ -458,7 +800,7 @@ async function openProject(proj, opts = {}) {
     }
 
     indexLoadToken += 1;
-    loading(refresh ? '作品一覧を更新中...' : '初回取得中...', proj.paginate ? '全ページを順次取得します' : '');
+    loading(refresh ? '作品一覧を更新中...' : '初回取得中...', 'Safari 直撃 → CF Worker 順');
     try {
         await fetchIndexFresh(proj, indexLoadToken);
     } catch (e) { err(e.message); nav.pop(); }
@@ -569,7 +911,7 @@ async function openChapters(proj, manga, opts = {}) {
     }
     loading(`「${manga.title}」の話数を取得...`);
     try {
-        const data = await call({
+        const data = await extract({
             url: manga.url,
             mode: 'chapters',
             selector_chapter: proj.selectorChapter,
@@ -605,11 +947,11 @@ function showChapters(proj, manga, data) {
     $$('.chrow').forEach(r => r.onclick = () => openReader(proj, manga, filtered[+r.dataset.i]));
 }
 
-/* ── ③ 縦読み ── */
+/* ── ③ 縦読み / 動画 ── */
 async function openReader(proj, manga, chapter) {
-    loading(`「${chapter.title}」を読み込み...`);
+    loading(`「${chapter.title}」を読み込み...`, '漫画URLのみ取得 · 画像は CDN 直叩き');
     try {
-        const data = await call({
+        const data = await extract({
             url: chapter.url,
             mode: 'media',
             selector_media: proj.selectorMedia,
@@ -633,9 +975,20 @@ async function openReader(proj, manga, chapter) {
 
 function showReader(data, manga, chapter, back) {
     screen.className = 'black';
-    const imgs = (data.images || []).map((s, i) =>
-        `<figure class="page" data-p="${i + 1}">${imgHtml(s, 'page-img', `P${i + 1}`)}<figcaption>P${i + 1}</figcaption></figure>`
-    ).join('');
+
+    let body = '';
+    if (data.videos?.length) {
+        body = data.videos.map((src, i) =>
+            `<figure class="page video-page" data-p="${i + 1}">
+                <video class="page-video" controls playsinline preload="metadata" src="${esc(mediaSrc(src))}" data-direct="${esc(src)}"></video>
+                <figcaption>Part ${i + 1}</figcaption>
+            </figure>`
+        ).join('');
+    } else {
+        body = (data.images || []).map((s, i) =>
+            `<figure class="page" data-p="${i + 1}">${imgHtml(s, 'page-img', `P${i + 1}`)}<figcaption>P${i + 1}</figcaption></figure>`
+        ).join('');
+    }
 
     screen.innerHTML = `
         <div class="reader-wrap">
@@ -648,11 +1001,18 @@ function showReader(data, manga, chapter, back) {
                 <span id="page-ind">1 / ${data.count}P</span>
             </div>
             <div class="read-progress"><div class="read-progress-bar" id="rpbar"></div></div>
-            <div class="vscroll" id="vscroll">${imgs}</div>
+            <div class="vscroll" id="vscroll">${body}</div>
         </div>`;
 
     $('#vb').onclick = back;
     bindImages();
+    $$('.page-video').forEach(v => {
+        v.onerror = () => {
+            if (v.dataset.retried) return;
+            v.dataset.retried = '1';
+            if (v.dataset.direct) v.src = v.dataset.direct;
+        };
+    });
 
     const scroll = $('#vscroll');
     const bar = $('#rpbar');
@@ -675,7 +1035,7 @@ function showReader(data, manga, chapter, back) {
     updateProgress();
 
     scroll.addEventListener('click', e => {
-        if (e.target.closest('.back') || e.target.closest('a')) return;
+        if (e.target.closest('.back') || e.target.closest('a') || e.target.closest('video')) return;
         headVisible = !headVisible;
         $('#vhead').classList.toggle('hidden-head', !headVisible);
         $('.read-progress')?.classList.toggle('hidden-head', !headVisible);
@@ -803,49 +1163,58 @@ function renderSettings() {
     screen.innerHTML = `
         ${hdr('Settings')}
         <div class="sbody">
+            <p class="sec-label">取得モード</p>
+            <div class="sgrp">
+                <div class="srow"><div><strong>クライアント直撃型</strong><small>Safari → CF Worker → 自宅 relay。Render 帯域・API 不使用</small></div><span>📱</span></div>
+            </div>
+            <p class="sec-label">Cloudflare Worker</p>
+            <div class="sgrp">
+                <label class="fld"><span>Worker URL（HTML 取得用）</span><input id="s-cf" placeholder="https://xxx.workers.dev"></label>
+                <div class="srow"><button class="btn-sm" id="s-cf-save">保存</button><small>Render の CF_FETCH_URL と同じ URL</small></div>
+            </div>
             <p class="sec-label">表示</p>
             <div class="sgrp">
-                <div class="srow"><div><strong>画像プロキシ</strong><small>CORS・表示エラー時に中継（推奨ON）</small></div><button class="toggle ${useProxy ? 'on' : ''}" id="t-proxy"></button></div>
-            </div>
-            <p class="sec-label">サブスクリプション</p>
-            <div class="sgrp">
-                <div class="srow"><div><strong>無料プラン</strong><small>広告が表示されます</small></div><span>👑</span></div>
-            </div>
-            <p class="sec-label">セキュリティ</p>
-            <div class="sgrp">
-                <div class="srow"><div>アプリロックを有効にする</div><button class="toggle" id="t-lock"></button></div>
+                <div class="srow"><div><strong>画像プロキシ</strong><small>通常 OFF（CDN 直叩き）。表示失敗時のみ ON</small></div><button class="toggle ${useProxy ? 'on' : ''}" id="t-proxy"></button></div>
             </div>
             <p class="sec-label">サーバー</p>
             <div class="sgrp">
-                <label class="fld"><span>サーバーURL（空欄=自動）</span><input id="s-api" placeholder="https://example.com"></label>
+                <label class="fld"><span>ホスト URL（空欄=自動）</span><input id="s-api" placeholder="https://example.com"></label>
                 <div class="srow"><button class="btn-sm" id="s-api-save">URLを保存</button><button class="btn-sm ghost" id="s-api-reset">自動</button></div>
-                <div class="srow"><div><small id="s-api-show">${esc(refreshApiUrls())}</small><small>/extract · /proxy</small></div></div>
+                <div class="srow"><div><small id="s-api-show">${esc(refreshApiUrls())}</small><small>/relay · /config</small></div></div>
                 <div class="srow"><button class="btn-sm" id="ping-srv"><i class="fa-solid fa-signal"></i> 接続確認</button><span id="ping-st"></span></div>
             </div>
             <p class="sec-label">スマホに追加</p>
             <div class="sgrp pwa-hint" id="pwa-hint">
-                <div class="srow"><div><strong>ホーム画面に追加</strong><small id="pwa-steps">サーバーURLをスマホのブラウザで開き、メニューから「ホーム画面に追加」</small></div><span>📱</span></div>
+                <div class="srow"><div><strong>ホーム画面に追加</strong><small>Render URL を Safari で開き「ホーム画面に追加」</small></div><span>📱</span></div>
             </div>
         </div>`;
+    $('#s-cf').value = localStorage.getItem('rx-cf-worker') || RX_CONFIG.cfWorker || '';
+    $('#s-cf-save').onclick = () => {
+        const v = $('#s-cf').value.trim().replace(/\/$/, '');
+        if (v) localStorage.setItem('rx-cf-worker', v);
+        else localStorage.removeItem('rx-cf-worker');
+        toast(v ? 'Worker URL を保存しました' : 'Worker URL をクリアしました', 'ok');
+    };
     $('#t-proxy').onclick = function () {
         useProxy = !useProxy;
         localStorage.setItem('rx-proxy', useProxy ? '1' : '0');
         this.classList.toggle('on', useProxy);
-        toast(useProxy ? '画像プロキシ ON' : '画像プロキシ OFF');
+        toast(useProxy ? '画像プロキシ ON' : '画像プロキシ OFF（CDN 直叩き）');
     };
-    $('#t-lock').onclick = function () { this.classList.toggle('on'); toast('アプリロック（デモ）'); };
     $('#s-api').value = localStorage.getItem('rx-api') || '';
     $('#s-api-save').onclick = () => {
         const v = $('#s-api').value.trim().replace(/\/$/, '');
         if (v) localStorage.setItem('rx-api', v);
         else localStorage.removeItem('rx-api');
         $('#s-api-show').textContent = refreshApiUrls();
-        toast('サーバーURLを保存しました', 'ok');
+        loadRemoteConfig();
+        toast('ホスト URL を保存しました', 'ok');
     };
     $('#s-api-reset').onclick = () => {
         localStorage.removeItem('rx-api');
         $('#s-api').value = '';
         $('#s-api-show').textContent = refreshApiUrls();
+        loadRemoteConfig();
         toast('自動検出に戻しました');
     };
     $('#ping-srv').onclick = async () => {
@@ -855,13 +1224,13 @@ function renderSettings() {
         try {
             const r = await fetch(`${base}/health`);
             const d = await r.json();
-            st.textContent = d.ok ? '✓ 接続OK' : '✗ エラー';
+            st.textContent = d.ok ? `✓ ${d.mode}` : '✗ エラー';
             st.className = d.ok ? 'ok' : 'ng';
-            toast(d.ok ? 'サーバー接続 OK' : 'サーバー応答異常', d.ok ? 'ok' : 'warn');
+            toast(d.ok ? '接続 OK（client-direct）' : '応答異常', d.ok ? 'ok' : 'warn');
         } catch {
             st.textContent = '✗ 未接続';
             st.className = 'ng';
-            toast('extractor.py を起動してください', 'warn');
+            toast('サーバーに接続できません', 'warn');
         }
     };
 }
@@ -920,4 +1289,4 @@ function switchTab(name) {
 }
 $$('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
-switchTab('projects');
+loadRemoteConfig().then(() => switchTab('projects'));

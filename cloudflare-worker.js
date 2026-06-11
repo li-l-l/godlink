@@ -7,7 +7,8 @@
  * 3. 発行された URL (例: https://godlink-fetch.xxxx.workers.dev) をコピー
  * 4. Render → Environment → CF_FETCH_URL にその URL を設定 → 再デプロイ
  *
- * Render は Python を動かし続け、HTML 取得だけ Cloudflare エッジ経由にする構成。
+ * Render は静的ホスト + /config のみ。
+ * HTML 取得は iPhone の app.js が Worker を直接叩く（Render 帯域不使用）。
  */
 export default {
   async fetch(request) {

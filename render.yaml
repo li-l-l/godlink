@@ -4,15 +4,12 @@ services:
     name: godlink
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt && playwright install chromium
-    startCommand: gunicorn extractor:app --bind 0.0.0.0:$PORT --timeout 180 --workers 1
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn extractor:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.7"
-      # 任意: Cloudflare Worker URL (cloudflare-worker.js をデプロイ後に設定)
+      # Cloudflare Worker URL → クライアントが直接叩く（Render 帯域・IP ブロック回避）
       # - key: CF_FETCH_URL
       #   value: "https://your-worker.workers.dev"
-      # 任意: ScraperAPI 無料キー (月1000リクエスト)
-      # - key: SCRAPER_API_KEY
-      #   sync: false
