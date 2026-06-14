@@ -8,11 +8,24 @@
  */
 export default {
   async fetch(request) {
+    const cors = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Accept, Accept-Language',
+    };
+
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: cors });
+    }
+
     const { searchParams } = new URL(request.url);
     const target = searchParams.get('url');
 
     if (!target || !target.startsWith('https://')) {
-      return Response.json({ error: 'url パラメータ (https://...) が必要です' }, { status: 400 });
+      return Response.json(
+        { error: 'url パラメータ (https://...) が必要です' },
+        { status: 400, headers: cors },
+      );
     }
 
     const origin = new URL(target).origin + '/';
@@ -43,7 +56,7 @@ export default {
       status: res.status,
       headers: {
         'Content-Type': res.headers.get('content-type') || 'text/html; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
+        ...cors,
       },
     });
   },

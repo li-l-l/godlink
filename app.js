@@ -125,7 +125,16 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 /* ── クライアント側 HTML 取得（Safari 直撃 → CF Worker → /relay） ── */
 function cfWorkerUrl() {
-    return (localStorage.getItem('rx-cf-worker') || RX_CONFIG.cfWorker || '').replace(/\/$/, '');
+    const raw = (localStorage.getItem('rx-cf-worker') || RX_CONFIG.cfWorker || '').trim();
+    if (!raw) return '';
+    try {
+        const u = new URL(raw);
+        u.search = '';
+        u.hash = '';
+        return u.origin + u.pathname.replace(/\/$/, '');
+    } catch {
+        return raw.replace(/\/$/, '').split('?')[0].split('#')[0];
+    }
 }
 
 async function loadRemoteConfig() {
