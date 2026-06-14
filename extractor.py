@@ -19,8 +19,9 @@ FETCH_TIMEOUT = 45
 
 CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Accept, Accept-Language',
+    'Access-Control-Allow-Methods': 'GET, POST, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Accept, Accept-Language, Range',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges',
 }
 
 
@@ -111,9 +112,62 @@ def relay():
         return _cors_response(str(e), 502, 'text/plain; charset=utf-8')
 
 
-@app.route('/proxy', methods=['GET', 'OPTIONS'])
+def _media_referer(url):
+    lower = (url or '').lower()
+    if 'twimg.com' in lower or 'twitter.com' in lower or 'x.com' in lower:
+        return 'https://twitter.com/'
+    return _referer(url)
+
+
+def _is_video_url(url):
+    lower = (url or '').lower()
+    return (
+        'video.twimg.com' in lower
+        or '.m3u8' in lower
+        or '.mp4' in lower
+        or '.webm' in lower
+    )
+
+
+def _proxy_upstream(url):
+    is_video = _is_video_url(url)
+    headers = _safari_headers(
+        url,
+        'video/mp4,video/*,*/*;q=0.8' if is_video else 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+    )
+    headers['Referer'] = _media_referer(url)
+    range_hdr = request.headers.get('Range')
+    if range_hdr:
+        headers['Range'] = range_hdr
+
+    r = requests.get(url, headers=headers, timeout=60, stream=True)
+    r.raise_for_status()
+
+    skip = {'content-encoding', 'transfer-encoding', 'connection'}
+    passthrough = {
+        k: v for k, v in r.headers.items()
+        if k.lower() not in skip
+    }
+    ct = passthrough.get('Content-Type', '').split(';')[0]
+    if is_video and not ct.startswith('video/'):
+        passthrough['Content-Type'] = 'video/mp4'
+    elif not is_video and not ct.startswith('image/'):
+        passthrough['Content-Type'] = 'image/jpeg'
+
+    extra = {'Cache-Control': 'public, max-age=86400'}
+    extra.update(passthrough)
+
+    def generate():
+        for chunk in r.iter_content(chunk_size=65536):
+            if chunk:
+                yield chunk
+
+    return Response(generate(), status=r.status_code, headers={**CORS_HEADERS, **extra})
+
+
+@app.route('/proxy', methods=['GET', 'HEAD', 'OPTIONS'])
 def proxy_media():
-    """画像フォールバック用の最小リレー（通常は Safari が CDN 直叩き）。"""
+    """画像・動画リレー（Twitter CDN の Referer / Range 対応）。"""
     if request.method == 'OPTIONS':
         return _cors_response('', 204, 'text/plain')
 
@@ -122,21 +176,21 @@ def proxy_media():
         return err, code
 
     try:
-        r = requests.get(
-            url,
-            headers=_safari_headers(url, 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'),
-            timeout=30,
-        )
-        r.raise_for_status()
-        ct = r.headers.get('Content-Type', 'image/jpeg').split(';')[0]
-        if not ct.startswith('image/'):
-            ct = 'image/jpeg'
-        return _cors_response(
-            r.content,
-            200,
-            ct,
-            {'Cache-Control': 'public, max-age=86400'},
-        )
+        if request.method == 'HEAD':
+            is_video = _is_video_url(url)
+            headers = _safari_headers(
+                url,
+                'video/mp4,video/*,*/*;q=0.8' if is_video else 'image/*,*/*;q=0.8',
+            )
+            headers['Referer'] = _media_referer(url)
+            r = requests.head(url, headers=headers, timeout=30, allow_redirects=True)
+            r.raise_for_status()
+            extra = {
+                k: v for k, v in r.headers.items()
+                if k.lower() not in {'content-encoding', 'transfer-encoding', 'connection'}
+            }
+            return Response('', status=r.status_code, headers={**CORS_HEADERS, **extra})
+        return _proxy_upstream(url)
     except requests.RequestException as e:
         return jsonify({'error': str(e)}), 502
 

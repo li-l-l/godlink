@@ -102,6 +102,7 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,sans-serif;ba
 .page img,.page .page-img{display:block;width:100%;height:auto;background:#111}
 .page-video{display:block;width:100%;max-height:85vh;background:#000}
 .page.video-page{margin-bottom:8px}
+.video-fallback{display:block;text-align:center;padding:10px 0 4px;color:#8cf;font-size:13px;text-decoration:underline}
 .page figcaption{display:none}
 .reader-ch-nav{display:flex;gap:8px;padding:16px 12px 28px;background:linear-gradient(transparent,#000 30%);position:sticky;bottom:0}
 .rcnav-btn{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;min-height:44px;padding:10px 8px;border:none;border-radius:12px;background:rgba(255,255,255,.12);color:#fff;font-size:12px;font-weight:600;cursor:pointer;-webkit-tap-highlight-color:transparent}

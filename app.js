@@ -640,6 +640,18 @@ function proxyUrl(url) {
     return `${PROXY}?url=${encodeURIComponent(url)}`;
 }
 
+function needsVideoProxy(url) {
+    if (!url) return false;
+    const s = url.toLowerCase();
+    return s.includes('video.twimg.com') || /\.(mp4|m3u8|webm)(\?|$)/i.test(s);
+}
+
+function videoSrc(url) {
+    if (!url) return '';
+    if (needsVideoProxy(url)) return proxyUrl(url);
+    return useProxy ? proxyUrl(url) : url;
+}
+
 function imgSrc(url) {
     if (!url) return '';
     return useProxy ? proxyUrl(url) : url;
@@ -1207,8 +1219,10 @@ function showReader(data, manga, chapter, back, ctx = {}) {
     if (data.videos?.length) {
         body = data.videos.map((src, i) =>
             `<figure class="page video-page" data-p="${i + 1}">
-                <video class="page-video" controls playsinline preload="metadata" src="${esc(mediaSrc(src))}" data-direct="${esc(src)}"></video>
+                <video class="page-video" controls playsinline preload="metadata" webkit-playsinline
+                    src="${esc(videoSrc(src))}" data-direct="${esc(src)}" data-proxy="${esc(proxyUrl(src))}"></video>
                 <figcaption>Part ${i + 1}</figcaption>
+                <a class="video-fallback" href="${esc(src)}" target="_blank" rel="noopener">再生できない場合はこちら</a>
             </figure>`
         ).join('');
     } else {
@@ -1257,9 +1271,17 @@ function showReader(data, manga, chapter, back, ctx = {}) {
     bindImages();
     $$('.page-video').forEach(v => {
         v.onerror = () => {
-            if (v.dataset.retried) return;
-            v.dataset.retried = '1';
-            if (v.dataset.direct) v.src = v.dataset.direct;
+            if (v.dataset.proxy && v.src !== v.dataset.proxy) {
+                v.src = v.dataset.proxy;
+                v.load();
+                return;
+            }
+            if (v.dataset.direct && v.src !== v.dataset.direct) {
+                v.src = v.dataset.direct;
+                v.load();
+                return;
+            }
+            toast('動画を再生できません。下のリンクから直接開いてください', 'warn');
         };
     });
 
