@@ -19,7 +19,7 @@ FETCH_TIMEOUT = 45
 
 CORS_HEADERS = {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Accept, Accept-Language',
 }
 
@@ -80,9 +80,9 @@ def health():
     })
 
 
-@app.route('/relay', methods=['GET', 'OPTIONS'])
+@app.route('/relay', methods=['GET', 'POST', 'OPTIONS'])
 def relay():
-    """CORS 付与リレー — 自宅 PC 等（一般回線 IP）向けフォールバック。Render 上では非推奨。"""
+    """CORS 付与リレー — GET/POST 転送（twivideo API 等）。"""
     if request.method == 'OPTIONS':
         return _cors_response('', 204, 'text/plain')
 
@@ -91,7 +91,20 @@ def relay():
         return err, code
 
     try:
-        r = requests.get(url, headers=_safari_headers(url), timeout=FETCH_TIMEOUT)
+        headers = _safari_headers(url)
+        if request.method == 'POST':
+            headers['Content-Type'] = request.headers.get(
+                'Content-Type', 'application/x-www-form-urlencoded'
+            )
+            headers['X-Requested-With'] = 'XMLHttpRequest'
+            r = requests.post(
+                url,
+                headers=headers,
+                data=request.get_data(),
+                timeout=FETCH_TIMEOUT,
+            )
+        else:
+            r = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT)
         ct = r.headers.get('Content-Type', 'text/html; charset=utf-8').split(';')[0]
         return _cors_response(r.content, r.status_code, ct)
     except requests.RequestException as e:

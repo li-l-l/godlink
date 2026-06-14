@@ -21,7 +21,7 @@ let RELAY = `${API_BASE}/relay`;
 let PROXY = `${API_BASE}/proxy`;
 let RX_CONFIG = { mode: 'client-direct', cfWorker: localStorage.getItem('rx-cf-worker') || '' };
 
-const STORE_VER = 'rx-v7';
+const STORE_VER = 'rx-v8';
 const INDEX_BATCH = 60;
 
 const SITE_UA = (
@@ -38,27 +38,46 @@ const BLOCK_PATTERNS = [
     'checking your browser', 'access denied', 'enable javascript and cookies to continue',
     'attention required! | cloudflare',
 ];
-const VALID_HINTS = ['manga-vertical', 'manga-list', 'mgcdn', 'mangaraw', 'di-1hua'];
+const VALID_HINTS = ['manga-vertical', 'manga-list', 'mgcdn', 'mangaraw', 'di-1hua', 'art_li', 'twivideo', 'video.twimg.com'];
 const AD_SELECTORS = [
     'script', 'iframe', 'noscript', 'embed', 'object', 'ins', 'aside',
     '.ads', '.ad', '.advert', '.banner-ad', '[class*="ad-"]', '[id*="ad-"]',
     '[class*="popup"]', '[class*="popunder"]',
 ];
 
-const BUILTIN = [{
-    id: 'mangaraw',
-    name: '[COMIC] 漫画me',
-    urlPattern: 'mangaraw.best',
-    listUrl: 'https://mangaraw.best/manga-list',
-    paginate: true,
-    selectorCard: '.manga-vertical',
-    selectorImg: 'img.cover',
-    selectorLink: '.cover-frame a, a[href^="/raw/"]:not([href*="di-"])',
-    selectorChapter: 'main a[href*="di-"][href*="hua"]',
-    selectorMedia: 'main img[src*="mgcdn"]',
-    icon: '🇯🇵',
-    premium: true,
-}];
+const BUILTIN = [
+    {
+        id: 'mangaraw',
+        name: '[COMIC] 漫画me',
+        urlPattern: 'mangaraw.best',
+        listUrl: 'https://mangaraw.best/manga-list',
+        paginate: true,
+        selectorCard: '.manga-vertical',
+        selectorImg: 'img.cover',
+        selectorLink: '.cover-frame a, a[href^="/raw/"]:not([href*="di-"])',
+        selectorChapter: 'main a[href*="di-"][href*="hua"]',
+        selectorMedia: 'main img[src*="mgcdn"]',
+        icon: '🇯🇵',
+        premium: true,
+    },
+    {
+        id: 'twivideo',
+        name: '[VIDEO] TWIVIDEO',
+        urlPattern: 'twivideo.net',
+        listUrl: 'https://twivideo.net/?ranking',
+        indexApi: 'twivideo',
+        paginate: true,
+        paginateLimit: 50,
+        directPlay: true,
+        selectorCard: '.art_li:not(.item_add)',
+        selectorImg: 'img',
+        selectorLink: 'a.item_link',
+        selectorChapter: '',
+        selectorMedia: '',
+        icon: '🎬',
+        premium: true,
+    },
+];
 
 const SEGS = [
     { id: 'all', label: 'すべて' },
@@ -84,9 +103,15 @@ let hist = JSON.parse(localStorage.getItem('rx-hist') || '[]');
 let useProxy = localStorage.getItem('rx-proxy') === '1';
 
 function initProjects() {
+    let stored = [];
+    try { stored = JSON.parse(localStorage.getItem('rx-proj') || '[]'); } catch { stored = []; }
     if (localStorage.getItem('rx-ver') !== STORE_VER) {
         localStorage.setItem('rx-ver', STORE_VER);
-        localStorage.setItem('rx-proj', JSON.stringify(BUILTIN));
+        for (const b of BUILTIN) {
+            if (!stored.some(p => p.id === b.id)) stored.unshift(b);
+        }
+        if (!stored.length) stored = [...BUILTIN];
+        localStorage.setItem('rx-proj', JSON.stringify(stored));
     }
     return JSON.parse(localStorage.getItem('rx-proj') || '[]');
 }
@@ -162,6 +187,70 @@ async function fetchPage(url) {
         'Settings → Cloudflare Worker URL を設定するか、\n' +
         '自宅 PC で python extractor.py を起動してください。'
     );
+}
+
+async function fetchPostPage(targetUrl, formData, refererUrl = targetUrl) {
+    const body = new URLSearchParams(formData).toString();
+    const postHeaders = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'text/html,*/*',
+        'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8',
+    };
+
+    const cf = cfWorkerUrl();
+    if (cf) {
+        try {
+            const r = await fetch(`${cf}?url=${encodeURIComponent(targetUrl)}`, {
+                method: 'POST',
+                headers: postHeaders,
+                body,
+            });
+            if (r.ok) {
+                const html = await r.text();
+                if (!looksBlocked(r.status, html)) return { html, route: 'cf-worker-post' };
+            }
+        } catch { /* next */ }
+    }
+
+    try {
+        const r = await fetch(`${RELAY}?url=${encodeURIComponent(targetUrl)}`, {
+            method: 'POST',
+            headers: postHeaders,
+            body,
+        });
+        if (r.ok) {
+            const html = await r.text();
+            if (!looksBlocked(r.status, html)) return { html, route: 'relay-post' };
+        }
+    } catch { /* ignore */ }
+
+    throw new Error(
+        'API を取得できませんでした。\n\n' +
+        'Settings → Cloudflare Worker URL を設定してください。'
+    );
+}
+
+function twivideoOrder(listUrl) {
+    const sort = new URL(listUrl).searchParams.get('sort');
+    if (sort === '3days') return '72';
+    if (sort === 'week') return '168';
+    return '24';
+}
+
+async function fetchTwivideoList(listUrl, offset, limit) {
+    const apiUrl = 'https://twivideo.net/templates/view_lists.php';
+    const { html } = await fetchPostPage(apiUrl, {
+        offset: String(offset),
+        limit: String(limit),
+        tag: 'null',
+        type: 'ranking',
+        order: twivideoOrder(listUrl),
+        le: '1000',
+        ty: 'p6',
+        myarray: '[]',
+        offset_int: String(offset),
+    }, listUrl);
+    return html;
 }
 
 /* ── クライアント側 DOM 解析（広告除去 → 純粋 URL 抽出） ── */
@@ -257,7 +346,9 @@ function isPageImage(src) {
 function isPageVideo(src) {
     if (!src || isJunkMedia(src)) return false;
     const s = src.toLowerCase();
-    return /\.(m3u8|mp4|webm)(\?|$)/i.test(s) || (s.includes('/video/') && !s.includes('ad'));
+    return /\.(m3u8|mp4|webm)(\?|$)/i.test(s)
+        || s.includes('video.twimg.com')
+        || (s.includes('/video/') && !s.includes('ad'));
 }
 
 function listBaseUrl(url) {
@@ -294,6 +385,9 @@ function parseCard(card, base, imgSel, linkSel) {
     let { href: detail, text: linkText } = linkOf(linkEl, base);
     if (!name) name = linkText || (card.textContent || '').trim().slice(0, 80);
 
+    const rankEl = card.querySelector('.item_ranking');
+    if (rankEl?.textContent?.trim()) name = rankEl.textContent.trim();
+
     const tEl = card.querySelector('.latest-chapter a, h2 a');
     if (tEl) {
         const { text: t2 } = linkOf(tEl, base);
@@ -316,6 +410,34 @@ function parseCards(doc, base, cardSel, imgSel, linkSel) {
     return [...doc.querySelectorAll(cardSel)]
         .map(card => parseCard(card, base, imgSel, linkSel))
         .filter(Boolean);
+}
+
+async function extractTwivideoIndex(proj, page) {
+    const limit = proj.paginateLimit || 50;
+    const pageNum = page != null ? Math.max(1, parseInt(page, 10)) : 1;
+    const offset = (pageNum - 1) * limit;
+    const listUrl = proj.listUrl || 'https://twivideo.net/?ranking';
+    const html = await fetchTwivideoList(listUrl, offset, limit);
+    const doc = parseDoc(html);
+    const cardSel = proj.selectorCard || '.art_li:not(.item_add)';
+    if (!doc.querySelector(cardSel)) {
+        throw new Error(pageNum > 1 ? `ページ ${pageNum} に動画がありません` : '動画が見つかりません');
+    }
+    const items = parseCards(doc, listUrl, cardSel, proj.selectorImg, proj.selectorLink);
+    items.forEach((it, i) => {
+        if (!it.title || it.title === '無題') it.title = `No.${offset + i + 1}`;
+    });
+    if (!items.length) throw new Error('有効な動画データがありません');
+    const hasMore = items.length >= limit && offset + limit < 1000;
+    return {
+        mode: 'index',
+        title: 'TWIVIDEO ランキング',
+        source_url: listUrl,
+        items,
+        count: items.length,
+        page: pageNum,
+        total_pages: pageNum === 1 ? (hasMore ? Math.ceil(1000 / limit) : 1) : null,
+    };
 }
 
 async function extractIndex(req) {
@@ -691,6 +813,7 @@ function indexBody(proj, page) {
 }
 
 async function fetchIndexPage(proj, page) {
+    if (proj.indexApi === 'twivideo') return extractTwivideoIndex(proj, page);
     return extract(indexBody(proj, page));
 }
 
@@ -856,7 +979,15 @@ function bindIndexCards(proj, items) {
     $$('.card').forEach(el => {
         el.onclick = e => {
             if (e.target.closest('.pheart')) return;
-            openChapters(proj, items[+el.dataset.i]);
+            const item = items[+el.dataset.i];
+            if (proj.directPlay) {
+                openReader(proj, item, { title: item.title, url: item.url }, {
+                    chapters: items,
+                    chapterIndex: +el.dataset.i,
+                });
+            } else {
+                openChapters(proj, item);
+            }
         };
     });
     $$('.pheart').forEach(btn => {
@@ -990,6 +1121,42 @@ function showChapters(proj, manga, data) {
 
 /* ── ③ 縦読み / 動画 ── */
 async function openReader(proj, manga, chapter, ctx = {}) {
+    const videoUrl = chapter.url || manga.url;
+    const isDirectVideo = proj.directPlay || isPageVideo(videoUrl);
+
+    if (isDirectVideo) {
+        const data = {
+            mode: 'media',
+            type: 'video',
+            title: chapter.title || manga.title,
+            source_url: videoUrl,
+            videos: [videoUrl],
+            images: [],
+            count: 1,
+        };
+        const readerCtx = { ...ctx, proj };
+        const mount = () => showReader(data, manga, chapter, () => popNav(), readerCtx);
+        if (ctx.replace) {
+            nav[nav.length - 1] = mount;
+            mount();
+        } else {
+            pushNav(mount);
+        }
+        hist.unshift({
+            type: 'read',
+            title: chapter.title || manga.title,
+            url: videoUrl,
+            mangaUrl: manga.url || videoUrl,
+            mangaTitle: manga.title,
+            projectId: proj.id,
+            projectName: proj.name,
+            pages: 1,
+            ts: Date.now(),
+        });
+        saveHist();
+        return;
+    }
+
     loading(`「${chapter.title}」を読み込み...`, '漫画URLのみ取得 · 画像は CDN 直叩き');
     try {
         const data = await extract({
@@ -1181,7 +1348,13 @@ function renderFav() {
     $$('.frow').forEach(r => r.onclick = () => {
         const f = favs[+r.dataset.i];
         const p = projects.find(x => x.id === f.projectId) || projects[0];
-        if (f.url && p) openChapters(p, f);
+        if (f.url && p) {
+            if (p.directPlay) {
+                openReader(p, f, { title: f.title, url: f.url });
+            } else {
+                openChapters(p, f);
+            }
+        }
     });
     bindImages();
 }
@@ -1213,8 +1386,12 @@ function renderHist() {
         const h = hist[+r.dataset.i];
         const p = projects.find(x => x.id === h.projectId) || projects[0];
         if (!p) return;
-        if (h.type === 'read' && h.mangaUrl) {
-            openChapters(p, { url: h.mangaUrl, title: h.mangaTitle || h.title, thumbnail: null });
+        if (h.type === 'read' && h.url) {
+            if (p.directPlay) {
+                openReader(p, { title: h.mangaTitle || h.title, url: h.url }, { title: h.title, url: h.url });
+            } else if (h.mangaUrl) {
+                openChapters(p, { url: h.mangaUrl, title: h.mangaTitle || h.title, thumbnail: null });
+            }
         } else if (h.url) {
             openProject(p);
         }

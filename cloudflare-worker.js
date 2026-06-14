@@ -1,14 +1,10 @@
 /**
- * Cloudflare Worker — mangaraw HTML 取得用リレー
+ * Cloudflare Worker — HTML / POST API 取得用リレー
  *
- * デプロイ手順:
- * 1. https://dash.cloudflare.com → Workers → Create Worker
- * 2. このコードを貼り付けて Deploy
- * 3. 発行された URL (例: https://godlink-fetch.xxxx.workers.dev) をコピー
- * 4. Render → Environment → CF_FETCH_URL にその URL を設定 → 再デプロイ
+ * GET:  ?url=https://example.com/page
+ * POST: ?url=https://example.com/api  + body（form-urlencoded 等）
  *
- * Render は静的ホスト + /config のみ。
- * HTML 取得は iPhone の app.js が Worker を直接叩く（Render 帯域不使用）。
+ * デプロイ後、Settings または Render の CF_FETCH_URL に Worker URL を設定。
  */
 export default {
   async fetch(request) {
@@ -20,17 +16,28 @@ export default {
     }
 
     const origin = new URL(target).origin + '/';
-    const res = await fetch(target, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
-          'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-        'Referer': origin,
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'ja,en;q=0.9',
-      },
-      cf: { cacheTtl: 300 },
-    });
+    const safariUa =
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
+      'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
+    const headers = {
+      'User-Agent': safariUa,
+      Referer: origin,
+      'Accept-Language': 'ja,en;q=0.9',
+    };
+
+    let fetchOpts = { headers, cf: { cacheTtl: 300 } };
+
+    if (request.method === 'POST') {
+      headers['Content-Type'] = request.headers.get('Content-Type') || 'application/x-www-form-urlencoded';
+      headers['X-Requested-With'] = 'XMLHttpRequest';
+      headers.Accept = 'text/html,*/*';
+      fetchOpts = { ...fetchOpts, method: 'POST', body: await request.arrayBuffer() };
+    } else {
+      headers.Accept = 'text/html,application/xhtml+xml';
+    }
+
+    const res = await fetch(target, fetchOpts);
 
     return new Response(res.body, {
       status: res.status,
