@@ -21,7 +21,7 @@ let RELAY = `${API_BASE}/relay`;
 let PROXY = `${API_BASE}/proxy`;
 let RX_CONFIG = { mode: 'client-direct', cfWorker: localStorage.getItem('rx-cf-worker') || '' };
 
-const STORE_VER = 'rx-v8';
+const STORE_VER = 'rx-v9';
 const INDEX_BATCH = 60;
 
 const SITE_UA = (
@@ -38,7 +38,7 @@ const BLOCK_PATTERNS = [
     'checking your browser', 'access denied', 'enable javascript and cookies to continue',
     'attention required! | cloudflare',
 ];
-const VALID_HINTS = ['manga-vertical', 'manga-list', 'mgcdn', 'mangaraw', 'di-1hua', 'art_li', 'twivideo', 'video.twimg.com'];
+const VALID_HINTS = ['manga-vertical', 'manga-list', 'mgcdn', 'mangaraw', 'di-1hua', 'art_li', 'twivideo', 'video.twimg.com', 'post-list', 'momon-ga', 'post-hentai'];
 const AD_SELECTORS = [
     'script', 'iframe', 'noscript', 'embed', 'object', 'ins', 'aside',
     '.ads', '.ad', '.advert', '.banner-ad', '[class*="ad-"]', '[id*="ad-"]',
@@ -75,6 +75,21 @@ const BUILTIN = [
         selectorChapter: '',
         selectorMedia: '',
         icon: '🎬',
+        premium: true,
+    },
+    {
+        id: 'momonga',
+        name: '[COMIC] モモンガッ',
+        urlPattern: 'momon-ga.com',
+        listUrl: 'https://momon-ga.com/trend/',
+        paginate: false,
+        skipChapters: true,
+        selectorCard: '.post-list > a',
+        selectorImg: '.post-list-image img',
+        selectorLink: '',
+        selectorChapter: '',
+        selectorMedia: '#post-hentai img',
+        icon: '🦝',
         premium: true,
     },
 ];
@@ -348,6 +363,7 @@ function isPageImage(src) {
     const s = src.toLowerCase();
     if (SKIP_IMG.some(x => s.includes(x))) return false;
     if (s.includes('mgcdn') || /\/\d+\.(jpg|jpeg|png|webp)(\?|$)/i.test(s)) return true;
+    if (s.includes('momon-ga.com/galleries')) return true;
     if (s.includes('storage/images/covers')) return false;
     return s.includes('blogger.googleusercontent.com/img/') && !s.includes('avatar');
 }
@@ -390,9 +406,13 @@ function parseCard(card, base, imgSel, linkSel) {
     let name = imgEl?.getAttribute('alt') || '';
 
     let linkEl = linkSel ? card.querySelector(linkSel) : null;
+    if (!linkEl && card.tagName === 'A') linkEl = card;
     if (!linkEl) linkEl = card.querySelector('a[href^="/raw/"]') || card.querySelector('a[href]');
     let { href: detail, text: linkText } = linkOf(linkEl, base);
     if (!name) name = linkText || (card.textContent || '').trim().slice(0, 80);
+
+    const spanEl = card.querySelector('span');
+    if (spanEl?.textContent?.trim()) name = name || spanEl.textContent.trim();
 
     const rankEl = card.querySelector('.item_ranking');
     if (rankEl?.textContent?.trim()) name = rankEl.textContent.trim();
@@ -1006,6 +1026,11 @@ function bindIndexCards(proj, items) {
                     chapters: items,
                     chapterIndex: +el.dataset.i,
                 });
+            } else if (proj.skipChapters) {
+                openReader(proj, item, { title: item.title, url: item.url }, {
+                    chapters: items,
+                    chapterIndex: +el.dataset.i,
+                });
             } else {
                 openChapters(proj, item);
             }
@@ -1382,6 +1407,8 @@ function renderFav() {
         if (f.url && p) {
             if (p.directPlay) {
                 openReader(p, f, { title: f.title, url: f.url });
+            } else if (p.skipChapters) {
+                openReader(p, f, { title: f.title, url: f.url });
             } else {
                 openChapters(p, f);
             }
@@ -1420,6 +1447,8 @@ function renderHist() {
         if (h.type === 'read' && h.url) {
             if (p.directPlay) {
                 openReader(p, { title: h.mangaTitle || h.title, url: h.url }, { title: h.title, url: h.url });
+            } else if (p.skipChapters) {
+                openReader(p, { title: h.mangaTitle || h.title, url: h.mangaUrl || h.url }, { title: h.title, url: h.url });
             } else if (h.mangaUrl) {
                 openChapters(p, { url: h.mangaUrl, title: h.mangaTitle || h.title, thumbnail: null });
             }
